@@ -1,4 +1,3 @@
-app_code = r'''
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -748,26 +747,7 @@ with tab6:
 
 # Footer
 st.markdown("---")
-st.caption("🎓 Thesis Dashboard • Road Accidents Patterns in Bunawan, Agusan del Sur "
+st.caption("🎓 Capstone Dashboard • Road Accidents Patterns in Bunawan, Agusan del Sur "
            "Using Historical Data • Puno & Manuel • Agusan del Sur State University • 2026")
 '''
 
-with open('/content/app.py', 'w') as f:
-    f.write(app_code)
-
-# Verify the file was written correctly
-with open('/content/app.py', 'r') as f:
-    content = f.read()
-
-required_imports = ['import streamlit as st', 'import pandas as pd',
-                    'import numpy as np', 'import os', 'import glob',
-                    'import warnings']
-missing = [imp for imp in required_imports if imp not in content]
-
-print("✅ app.py created successfully!")
-print(f"   Size: {len(app_code)/1024:.1f} KB")
-print(f"   Location: /content/app.py")
-if missing:
-    print(f"   ⚠️ MISSING IMPORTS: {missing}")
-else:
-    print("   ✓ All required imports verified")
