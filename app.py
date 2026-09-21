@@ -107,16 +107,55 @@ def normalize_columns(frame):
 # ============================================================
 @st.cache_data
 def load_data():
-    """Load all sheets from the Excel file and concatenate safely."""
-    data_dir = '/content/data'
-    files = glob.glob(os.path.join(data_dir, '*.*'))
-    files = [f for f in files if f.lower().endswith(('.xlsx', '.xls', '.csv'))]
-
-    if not files:
-        files = glob.glob('*.xlsx') + glob.glob('*.xls') + glob.glob('*.csv')
+    """Load all sheets from the Excel file. Looks in the current folder (Streamlit Cloud) and /content/data (Colab)."""
+    search_paths = ['.', '/content/data']
+    files = []
+    for path in search_paths:
+        if os.path.isdir(path):
+            files += glob.glob(os.path.join(path, '*.xlsx'))
+            files += glob.glob(os.path.join(path, '*.xls'))
+            files += glob.glob(os.path.join(path, '*.csv'))
 
     if not files:
         return None, None
+
+    preferred = [f for f in files if 'dataset' in os.path.basename(f).lower()]
+    target_file = preferred[0] if preferred else files[0]
+
+    try:
+        if target_file.lower().endswith('.csv'):
+            try:
+                df = pd.read_csv(target_file, encoding='utf-8-sig', low_memory=False)
+            except UnicodeDecodeError:
+                df = pd.read_csv(target_file, encoding='latin-1', low_memory=False)
+            df['_source_sheet'] = 'CSV'
+            df = normalize_columns(df)
+        else:
+            xls = pd.ExcelFile(target_file)
+            sheet_frames = []
+            for sheet_name in xls.sheet_names:
+                try:
+                    sheet_df = pd.read_excel(xls, sheet_name=sheet_name, header=0)
+                    sheet_df['_source_sheet'] = str(sheet_name)
+                    sheet_df = normalize_columns(sheet_df)
+                    sheet_frames.append(sheet_df)
+                except Exception as e:
+                    st.warning(f"Could not read sheet '{sheet_name}': {e}")
+
+            if not sheet_frames:
+                st.error(f"No readable sheets in {target_file}")
+                return None, None
+
+            df = pd.concat(sheet_frames, ignore_index=True, sort=False)
+            df = normalize_columns(df)
+
+    except Exception as e:
+        st.error(f"Error reading {target_file}: {e}")
+        return None, None
+
+    df = df.dropna(how='all')
+    df = df.dropna(axis=1, how='all')
+    return df, os.path.basename(target_file)
 
     preferred = [f for f in files if 'dataset' in os.path.basename(f).lower()]
     target_file = preferred[0] if preferred else files[0]
