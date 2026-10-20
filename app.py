@@ -1,713 +1,545 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import os
-import glob
+import re
 import warnings
-warnings.filterwarnings('ignore')
+from itertools import combinations
 
+import numpy as np
+import pandas as pd
+import streamlit as st
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+from scipy.stats import chi2_contingency, f_oneway
 from sklearn.cluster import KMeans
-from sklearn.tree import DecisionTreeClassifier, plot_tree
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
-from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
-                             f1_score, roc_auc_score, confusion_matrix,
-                             classification_report, roc_curve, silhouette_score)
+                             f1_score, confusion_matrix, classification_report,
+                             silhouette_score)
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.preprocessing import LabelEncoder
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
-st.set_page_config(
-    page_title="Road Accident Patterns Dashboard - Bunawan",
-    page_icon="🚦",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+warnings.filterwarnings("ignore")
 
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #8B0000;
-        text-align: center;
-        padding: 1rem 0;
-        border-bottom: 3px solid #8B0000;
-    }
-    .sub-header {
-        font-size: 1.2rem;
-        color: #555;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #8B0000 0%, #C0392B 100%);
-        padding: 1.5rem;
-        border-radius: 12px;
-        color: white;
-        text-align: center;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-    }
-    .metric-card h2 { color: white; margin: 0; font-size: 2rem; }
-    .metric-card p { color: white; margin: 0; opacity: 0.9; }
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] {
-        background-color: #f0f2f6;
-        border-radius: 8px 8px 0 0;
-        padding: 10px 20px;
-        font-weight: 600;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #8B0000 !important;
-        color: white !important;
-    }
-</style>
-""", unsafe_allow_html=True)
+CONFIG = {
+    "date_col": "DATE",
+    "time_col": "TIME",
+    "location_col": "LOCATION",
+    "weather_col": "WEATHER",
+    "road_col": "ROAD CONDITION",
+    "vehicle_col": "VEHICLE TYPE",
+    "cause_col": "CAUSE",
+    "severity_col": "SEVERITY",
+    "gender_col": "GENDER",
+    "year_col": "_year",
+    "target_name": "_severity_label",
+    "high_risk_keywords": ["fatal", "major", "severe", "serious"],
+    "low_risk_keywords": ["minor", "no injury", "none"],
+    "random_state": 42,
+    "default_clusters": 4,
+    "default_depth": 5,
+}
 
+COLUMN_ALIASES = {
+    "date": "DATE",
+    "time": "TIME",
+    "location": "LOCATION",
+    "weather": "WEATHER",
+    "roadcondition": "ROAD CONDITION",
+    "raodcondition": "ROAD CONDITION",
+    "vehicletype": "VEHICLE TYPE",
+    "cause": "CAUSE",
+    "severity": "SEVERITY",
+    "gender": "GENDER",
+}
 
-# ============================================================
-# COLUMN NORMALIZATION HELPER
-# ============================================================
+def clean_text(value):
+    if pd.isna(value):
+        return ""
+    text = str(value)
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
+    text = re.sub(r"[^\x00-\x7F]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
 def normalize_columns(frame):
-    """Strip whitespace/BOM, unify variant spellings, drop duplicate columns."""
     frame = frame.copy()
-    frame.columns = [str(c).strip().replace('\ufeff', '') for c in frame.columns]
-
-    canonical_map = {
-        'DATE': 'DATE',
-        'TIME': 'TIME',
-        'LOCATION': 'LOCATION',
-        'WEATHER': 'WEATHER',
-        'ROADCONDITION': 'ROAD CONDITION',
-        'RAODCONDITION': 'ROAD CONDITION',
-        'VEHICLETYPE': 'VEHICLE TYPE',
-        'CAUSE': 'CAUSE',
-        'SEVERITY': 'SEVERITY',
-        'GENDER': 'GENDER',
-        '_SOURCESHEET': '_source_sheet',
-    }
-
-    def canonical(name):
-        key = name.upper().replace(' ', '').replace('_', '').replace('-', '')
-        return canonical_map.get(key, name)
-
-    frame.columns = [canonical(c) for c in frame.columns]
-    frame = frame.loc[:, ~frame.columns.duplicated(keep='first')]
+    frame.columns = [clean_text(c).upper().replace(" ", "") for c in frame.columns]
+    rename = {}
+    for col in frame.columns:
+        key = col.lower()
+        if key in COLUMN_ALIASES:
+            rename[col] = COLUMN_ALIASES[key]
+    frame = frame.rename(columns=rename)
+    frame = frame.loc[:, ~frame.columns.duplicated(keep="first")]
     return frame
 
+def derive_year_from_text(*candidates):
+    for text in candidates:
+        if text is None:
+            continue
+        match = re.search(r"(20\d{2})", str(text))
+        if match:
+            return int(match.group(1))
+    return np.nan
 
-# ============================================================
-# DATA LOADING
-# ============================================================
-@st.cache_data
-def load_data():
-    """Load all sheets from the Excel file. Looks in the current folder (Streamlit Cloud) and /content/data (Colab)."""
-    search_paths = ['.', '/content/data']
-    files = []
-    for path in search_paths:
-        if os.path.isdir(path):
-            files += glob.glob(os.path.join(path, '*.xlsx'))
-            files += glob.glob(os.path.join(path, '*.xls'))
-            files += glob.glob(os.path.join(path, '*.csv'))
-
-    if not files:
-        return None, None
-
-    preferred = [f for f in files if 'dataset' in os.path.basename(f).lower()]
-    target_file = preferred[0] if preferred else files[0]
-
-    try:
-        if target_file.lower().endswith('.csv'):
+def load_workbook(uploaded_files):
+    frames = []
+    for file in uploaded_files:
+        name = file.name
+        file.seek(0)
+        if name.lower().endswith(".csv"):
             try:
-                df = pd.read_csv(target_file, encoding='utf-8-sig', low_memory=False)
+                df = pd.read_csv(file, encoding="utf-8-sig", low_memory=False)
             except UnicodeDecodeError:
-                df = pd.read_csv(target_file, encoding='latin-1', low_memory=False)
-            df['_source_sheet'] = 'CSV'
-            df = normalize_columns(df)
-        else:
-            xls = pd.ExcelFile(target_file)
-            sheet_frames = []
-            for sheet_name in xls.sheet_names:
-                try:
-                    sheet_df = pd.read_excel(xls, sheet_name=sheet_name, header=0)
-                    sheet_df['_source_sheet'] = str(sheet_name)
-                    sheet_df = normalize_columns(sheet_df)
-                    sheet_frames.append(sheet_df)
-                except Exception as e:
-                    st.warning(f"Could not read sheet '{sheet_name}': {e}")
-
-            if not sheet_frames:
-                st.error(f"No readable sheets in {target_file}")
-                return None, None
-
-            df = pd.concat(sheet_frames, ignore_index=True, sort=False)
-            df = normalize_columns(df)
-
-    except Exception as e:
-        st.error(f"Error reading {target_file}: {e}")
-        return None, None
-
-    df = df.dropna(how='all')
-    df = df.dropna(axis=1, how='all')
-    return df, os.path.basename(target_file)
-
-
-@st.cache_data
-def preprocess_data(df, feature_cols, target_col='_derived_severity'):
-    df = df.copy()
-
-    if target_col not in df.columns:
-        if 'SEVERITY' in df.columns:
-            df[target_col] = df['SEVERITY'].astype(str).str.strip().str.lower()
-        else:
-            return None, None, None
-
-    valid_mask = df[target_col].notna() & (df[target_col] != 'nan') & (df[target_col] != '')
-    df = df[valid_mask].copy()
-
-    def map_severity(val):
-        v = str(val).strip().lower()
-        if any(k in v for k in ['fatal', 'major', 'severe', 'serious']):
-            return 'High-Risk'
-        if any(k in v for k in ['minor', 'no injury', 'low', 'none']):
-            return 'Low-Risk'
-        return 'Low-Risk'
-
-    df['_severity_label'] = df[target_col].apply(map_severity)
-    y = (df['_severity_label'] == 'High-Risk').astype(int)
-
-    X = df[feature_cols].copy()
-
-    for col in X.columns:
-        numeric_series = pd.to_numeric(X[col], errors='coerce')
-        if numeric_series.notna().sum() >= 0.5 * len(X):
-            X[col] = numeric_series.fillna(numeric_series.median() if numeric_series.notna().any() else 0)
-        else:
-            X[col] = X[col].astype(str).fillna('Unknown')
-            le = LabelEncoder()
-            X[col] = le.fit_transform(X[col])
-
-    mask = ~X.isna().any(axis=1)
-    X = X[mask]
-    y = y[mask]
-    return X, y, df
-
-
-def detect_feature_columns(df, max_features=15):
-    features = []
-    exclude = ['_source_sheet', 'DATE', 'TIME', 'SEVERITY', '_derived_severity',
-               '_severity_label', 'LOCATION', 'CAUSE']
-
-    for col in df.columns:
-        if col in exclude:
+                file.seek(0)
+                df = pd.read_csv(file, encoding="latin-1", low_memory=False)
+            df["_source_file"] = clean_text(name)
+            df["_year"] = derive_year_from_text(name)
+            frames.append(normalize_columns(df))
             continue
-        col_lower = col.lower()
-        if any(k in col_lower for k in ['date', 'time', 'id', 'index']):
-            continue
-        if df[col].dtype == 'object':
-            if df[col].nunique(dropna=True) > 60:
+        xls = pd.ExcelFile(file)
+        for sheet in xls.sheet_names:
+            try:
+                sheet_df = pd.read_excel(xls, sheet_name=sheet, header=0)
+            except Exception:
                 continue
-        features.append(col)
+            sheet_df["_source_file"] = clean_text(name)
+            sheet_year = derive_year_from_text(name, sheet)
+            sheet_df["_year"] = sheet_year
+            frames.append(normalize_columns(sheet_df))
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    combined = combined.loc[:, ~combined.columns.duplicated(keep="first")]
+    return combined
 
-    return features[:max_features]
+def standardize_severity(series, keywords_high, keywords_low):
+    def classify(value):
+        text = clean_text(value).lower()
+        if any(k in text for k in keywords_high):
+            return "High-Risk"
+        if any(k in text for k in keywords_low):
+            return "Low-Risk"
+        return np.nan
+    return series.apply(classify)
 
+def parse_time_hour(series):
+    def parse(value):
+        text = clean_text(value)
+        if not text:
+            return np.nan
+        match = re.match(r"^(\d{1,2}):(\d{2})", text)
+        if match:
+            return int(match.group(1))
+        return np.nan
+    return series.apply(parse)
 
-# ============================================================
-# TRAINING
-# ============================================================
-def train_decision_tree(X, y, test_size=0.2, random_state=42, max_depth=5):
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y
+def normalise_location(value):
+    text = clean_text(value).upper()
+    if not text:
+        return ""
+    text = re.sub(r"\bP\d+[A-Z]?\b", "", text)
+    text = re.sub(r"\bC\d+\b", "", text)
+    text = re.sub(r"\bCAMPO\s*\d+\b", "", text)
+    text = re.sub(r"\bBARANGAY\b", "", text)
+    text = re.sub(r"\s+", " ", text).strip(" ,.-")
+    return text
+
+def prepare_features(frame, cfg):
+    df = frame.copy()
+    severity_raw = df.get(cfg["severity_col"], pd.Series(dtype=object))
+    df[cfg["target_name"]] = standardize_severity(
+        severity_raw, cfg["high_risk_keywords"], cfg["low_risk_keywords"]
     )
+    df = df[df[cfg["target_name"]].notna()].copy()
 
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    if cfg["date_col"] in df.columns:
+        df[cfg["date_col"]] = pd.to_datetime(df[cfg["date_col"]], errors="coerce")
+    else:
+        df[cfg["date_col"]] = pd.NaT
 
-    dt = DecisionTreeClassifier(max_depth=max_depth, random_state=random_state,
-                                criterion='gini', class_weight='balanced')
-    dt.fit(X_train_scaled, y_train)
-    y_pred = dt.predict(X_test_scaled)
-    y_prob = dt.predict_proba(X_test_scaled)[:, 1]
+    if cfg["year_col"] in df.columns:
+        df[cfg["year_col"]] = pd.to_numeric(df[cfg["year_col"]], errors="coerce")
+        df[cfg["year_col"]] = df[cfg["year_col"]].fillna(df[cfg["date_col"]].dt.year)
+    else:
+        df[cfg["year_col"]] = df[cfg["date_col"]].dt.year
 
+    df["_month"] = df[cfg["date_col"]].dt.month
+    df["_hour"] = parse_time_hour(df.get(cfg["time_col"], pd.Series([""] * len(df))))
+
+    if cfg["location_col"] in df.columns:
+        df["_loc_key"] = df[cfg["location_col"]].apply(normalise_location)
+    else:
+        df["_loc_key"] = ""
+
+    return df
+
+def build_model_frame(df, cfg):
+    feature_cols = [
+        cfg["weather_col"], cfg["road_col"], cfg["vehicle_col"],
+        cfg["cause_col"], cfg["gender_col"], "_month", "_hour",
+    ]
+    feature_cols = [c for c in feature_cols if c in df.columns]
+    encoded = pd.DataFrame(index=df.index)
+    for col in feature_cols:
+        if col in ("_month", "_hour"):
+            encoded[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        else:
+            encoded[col] = df[col].astype(str).apply(clean_text)
+            encoded[col] = LabelEncoder().fit_transform(encoded[col])
+    target = (df[cfg["target_name"]] == "High-Risk").astype(int)
+    keep = encoded.notna().all(axis=1)
+    return encoded[keep], target[keep], feature_cols
+
+def cluster_hotspots(df, cfg, n_clusters):
+    location_freq = df["_loc_key"].value_counts()
+    features = pd.DataFrame({
+        "location_freq": df["_loc_key"].map(location_freq).fillna(0),
+        "month": df["_month"].fillna(1),
+        "hour": df["_hour"].fillna(12),
+        "severity_score": df[cfg["target_name"]].map({"Low-Risk": 0, "High-Risk": 1}).fillna(0),
+    })
+    features = features.dropna()
+    if len(features) < max(n_clusters * 2, 10):
+        return None
+    scaled = (features - features.mean()) / features.std(ddof=0).replace(0, 1)
+    model = KMeans(n_clusters=n_clusters, random_state=cfg["random_state"], n_init=10)
+    labels = model.fit_predict(scaled)
+    score = silhouette_score(scaled, labels) if len(set(labels)) > 1 else float("nan")
+    features = features.copy()
+    features["cluster"] = labels
+    features["location"] = df.loc[features.index, "_loc_key"].values
+    return {"features": features, "silhouette": score, "model": model}
+
+def cramers_v(table):
+    chi2, _, _, _ = chi2_contingency(table)
+    n = table.values.sum()
+    if n == 0:
+        return float("nan")
+    r, c = table.shape
+    return float(np.sqrt(chi2 / (n * max(r - 1, c - 1))))
+
+def association_pairs(df, columns):
+    rows = []
+    for a, b in combinations(columns, 2):
+        table = pd.crosstab(df[a].astype(str), df[b].astype(str))
+        if table.shape[0] < 2 or table.shape[1] < 2:
+            continue
+        try:
+            v = cramers_v(table)
+        except Exception:
+            continue
+        if np.isnan(v):
+            continue
+        rows.append({"variable_a": a, "variable_b": b, "cramers_v": round(v, 4)})
+    if not rows:
+        return pd.DataFrame(columns=["variable_a", "variable_b", "cramers_v"])
+    return pd.DataFrame(rows).sort_values("cramers_v", ascending=False).reset_index(drop=True)
+
+def train_tree(features, target, depth, seed):
+    if len(features) < 20 or target.nunique() < 2:
+        return None
+    x_train, x_test, y_train, y_test = train_test_split(
+        features, target, test_size=0.2, random_state=seed, stratify=target
+    )
+    model = DecisionTreeClassifier(max_depth=depth, criterion="gini",
+                                   class_weight="balanced", random_state=seed)
+    model.fit(x_train, y_train)
+    pred = model.predict(x_test)
+    metrics = {
+        "accuracy": accuracy_score(y_test, pred),
+        "precision": precision_score(y_test, pred, zero_division=0),
+        "recall": recall_score(y_test, pred, zero_division=0),
+        "f1": f1_score(y_test, pred, zero_division=0),
+    }
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+    cv_scores = cross_val_score(model, features, target, cv=cv, scoring="accuracy")
+    cm = confusion_matrix(y_test, pred)
+    report = classification_report(y_test, pred, output_dict=True, zero_division=0)
+    importance = pd.Series(model.feature_importances_, index=features.columns).sort_values(ascending=False)
     return {
-        'model': dt, 'y_pred': y_pred, 'y_prob': y_prob,
-        'y_test': y_test, 'X_test': X_test_scaled,
-        'X_train': X_train_scaled, 'y_train': y_train
-    }, scaler, X_train, X_test, y_train, y_test
-
-
-def compute_metrics(y_true, y_pred, y_prob):
-    return {
-        'Accuracy':  accuracy_score(y_true, y_pred),
-        'Precision': precision_score(y_true, y_pred, zero_division=0),
-        'Recall':    recall_score(y_true, y_pred, zero_division=0),
-        'F1-Score':  f1_score(y_true, y_pred, zero_division=0),
-        'ROC-AUC':   roc_auc_score(y_true, y_prob) if len(set(y_true)) > 1 else 0.0
+        "model": model, "metrics": metrics, "cv": cv_scores,
+        "confusion": cm, "report": report, "importance": importance,
+        "n_train": len(x_train), "n_test": len(x_test),
     }
 
+def bar_chart(series, title, color="#8B0000", top=None):
+    data = series.dropna()
+    if top:
+        data = data.head(top)
+    if data.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(8, max(3, 0.4 * len(data))))
+    ax.barh(data.index.astype(str), data.values, color=color, edgecolor="black")
+    ax.invert_yaxis()
+    ax.set_title(title)
+    ax.grid(axis="x", alpha=0.3)
+    fig.tight_layout()
+    return fig
 
-# ============================================================
-# LOAD DATA
-# ============================================================
-df_raw, filename = load_data()
+def line_chart(series, title, color="#1f4e79"):
+    data = series.dropna()
+    if data.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(data.index.astype(str), data.values, marker="o", color=color)
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    return fig
 
-st.markdown('<div class="main-header">🚦 Road Accident Patterns Dashboard</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Road Accidents Patterns in Bunawan, Agusan del Sur Using Historical Data<br>'
-            '<i>K-Means Clustering & Decision Tree Algorithm</i></div>', unsafe_allow_html=True)
+st.set_page_config(page_title="Road Accident Dashboard", page_icon="", layout="wide")
 
-# ============================================================
-# DEBUG PANEL
-# ============================================================
-with st.expander("🔍 Debug: Detected Data", expanded=False):
-    if df_raw is None:
-        st.error("❌ No dataset found. Please upload DATASETS.xlsx or a CSV file.")
-    else:
-        st.success(f"✅ Loaded file: `{filename}`")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Records", f"{df_raw.shape[0]:,}")
-        c2.metric("Columns", df_raw.shape[1])
-        if '_source_sheet' in df_raw.columns:
-            c3.metric("Sheets Combined", df_raw['_source_sheet'].nunique())
-        else:
-            c3.metric("Sheets", 1)
+st.title("Road Accident Dashboard")
+st.caption("Computed results from uploaded accident records")
 
-        st.write("**All detected columns:**")
-        st.code(list(df_raw.columns))
-
-        if '_source_sheet' in df_raw.columns:
-            st.write("**Records per year/sheet:**")
-            sheet_counts = df_raw['_source_sheet'].value_counts().sort_index()
-            st.dataframe(sheet_counts.rename('Records').to_frame(), use_container_width=True)
-
-        st.write("**First 5 rows:**")
-        st.dataframe(df_raw.head(), use_container_width=True)
-
-        st.write("**Data types & missing values:**")
-        info_df = pd.DataFrame({
-            'dtype': df_raw.dtypes.astype(str),
-            'missing': df_raw.isna().sum(),
-            'missing_%': (df_raw.isna().sum() / len(df_raw) * 100).round(2),
-            'unique': df_raw.nunique()
-        })
-        st.dataframe(info_df, use_container_width=True)
-
-if df_raw is None:
-    st.stop()
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-st.sidebar.header("⚙️ Model Configuration")
-
-default_features = detect_feature_columns(df_raw)
-all_cols = [c for c in df_raw.columns if not c.startswith('_') and c not in ['DATE', 'TIME']]
-
-feature_cols = st.sidebar.multiselect(
-    "Select predictor variables:",
-    options=all_cols,
-    default=default_features[:6]
+uploaded = st.sidebar.file_uploader(
+    "Upload dataset files",
+    type=["xlsx", "xls", "csv"],
+    accept_multiple_files=True,
 )
 
-test_size = st.sidebar.slider("Test size", 0.1, 0.4, 0.2, 0.05)
-random_state = st.sidebar.number_input("Random state", value=42, step=1)
-max_depth = st.sidebar.slider("Decision Tree max depth", 2, 15, 5)
-n_clusters = st.sidebar.slider("K-Means: number of clusters", 2, 10, 4)
-
-if len(feature_cols) < 2:
-    st.warning("⚠️ Please select at least 2 predictor variables from the sidebar.")
+if not uploaded:
+    st.info("Upload one or more dataset files to generate results.")
     st.stop()
 
-target_col = '_derived_severity'
-X, y, df_clean = preprocess_data(df_raw, feature_cols, target_col)
-
-if X is None or len(X) < 10:
-    st.error("❌ Not enough valid data after preprocessing. Check the Debug panel above.")
+raw = load_workbook(uploaded)
+if raw.empty:
+    st.error("No readable records were found in the uploaded files.")
     st.stop()
 
-results, scaler, X_train, X_test, y_train, y_test = train_decision_tree(
-    X, y, test_size=test_size, random_state=int(random_state), max_depth=max_depth
-)
+prepared = prepare_features(raw, CONFIG)
 
-metrics_table = pd.DataFrame({
-    'Decision Tree': compute_metrics(results['y_test'], results['y_pred'], results['y_prob'])
-}).T
+available_years = sorted(prepared[CONFIG["year_col"]].dropna().astype(int).unique().tolist())
+selected_years = st.sidebar.multiselect("Filter years", available_years, default=available_years)
+if selected_years:
+    prepared = prepared[prepared[CONFIG["year_col"]].isin(selected_years)].copy()
 
-# ============================================================
-# TABS
-# ============================================================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 Overview", "📈 EDA",
-    "🎯 K-Means Hotspots", "🌳 Decision Tree",
-    "📋 Cross-Validation", "💡 Recommendations"
+if prepared.empty:
+    st.warning("No records remain after the year filter.")
+    st.stop()
+
+cluster_count = st.sidebar.slider("Number of clusters", 2, 8, CONFIG["default_clusters"])
+tree_depth = st.sidebar.slider("Tree depth", 2, 12, CONFIG["default_depth"])
+
+tabs = st.tabs([
+    "Overview",
+    "Results Across Time",
+    "Variable Relationships",
+    "Accident Hotspots",
+    "Significant Factors",
+    "Model Performance",
+    "Decision Support",
 ])
 
-# ------------------------------------------------------------
-# TAB 1: OVERVIEW
-# ------------------------------------------------------------
-with tab1:
-    st.header("📊 Executive Overview")
+with tabs[0]:
+    total = len(prepared)
+    high = int((prepared[CONFIG["target_name"]] == "High-Risk").sum())
+    low = int((prepared[CONFIG["target_name"]] == "Low-Risk").sum())
+    cols = st.columns(4)
+    cols[0].metric("Records", f"{total:,}")
+    cols[1].metric("High-Risk", f"{high:,}")
+    cols[2].metric("Low-Risk", f"{low:,}")
+    cols[3].metric("Share high-risk", f"{high / total:.1%}" if total else "-")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.markdown(f'<div class="metric-card"><p>Total Records</p><h2>{len(df_clean):,}</h2></div>', unsafe_allow_html=True)
-    c2.markdown(f'<div class="metric-card"><p>Predictors Used</p><h2>{len(feature_cols)}</h2></div>', unsafe_allow_html=True)
-    c3.markdown(f'<div class="metric-card"><p>High-Risk</p><h2>{(y==1).sum():,}</h2></div>', unsafe_allow_html=True)
-    c4.markdown(f'<div class="metric-card"><p>Low-Risk</p><h2>{(y==0).sum():,}</h2></div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.subheader("🏆 Decision Tree Performance")
-    st.dataframe(metrics_table.style.format("{:.4f}").highlight_max(axis=0, color='#c6efce'), use_container_width=True)
-
-    st.subheader("📋 Dataset Sample")
-    st.dataframe(df_clean.head(10), use_container_width=True)
-
-# ------------------------------------------------------------
-# TAB 2: EDA
-# ------------------------------------------------------------
-with tab2:
-    st.header("📈 Exploratory Data Analysis")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Severity Distribution")
-        fig, ax = plt.subplots(figsize=(6, 4))
-        counts = df_clean['_severity_label'].value_counts()
-        colors = ['#e74c3c', '#2ecc71']
-        ax.pie(counts.values, labels=counts.index, autopct='%1.1f%%',
-               colors=colors[:len(counts)], startangle=90)
-        ax.set_title("High-Risk vs Low-Risk Accidents")
-        st.pyplot(fig)
-        plt.close()
-
-    with col2:
-        st.subheader("Class Counts")
-        st.dataframe(counts.rename('Count').to_frame().assign(
-            Percentage=lambda d: (d['Count']/d['Count'].sum()*100).round(2)
-        ), use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("Accidents by Year")
-
-    if 'DATE' in df_raw.columns:
-        df_dates = df_raw.copy()
-        df_dates['DATE_PARSED'] = pd.to_datetime(df_dates['DATE'], errors='coerce')
-        df_dates['YEAR'] = df_dates['DATE_PARSED'].dt.year
-        year_counts = df_dates['YEAR'].value_counts().sort_index()
-        fig, ax = plt.subplots(figsize=(10, 5))
-        year_counts.plot(kind='bar', color='#8B0000', ax=ax, edgecolor='black')
-        ax.set_xlabel("Year")
-        ax.set_ylabel("Number of Accidents")
-        ax.set_title("Road Accidents per Year in Bunawan")
-        ax.grid(axis='y', alpha=0.3)
-        plt.xticks(rotation=0)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-
-    st.markdown("---")
-    st.subheader("Feature Distributions")
-
-    cat_cols = [c for c in feature_cols if X[c].nunique() <= 15][:6]
-    if cat_cols:
-        n = len(cat_cols)
-        fig, axes = plt.subplots((n+2)//3, 3, figsize=(15, 4*((n+2)//3)))
-        axes = axes.flatten() if n > 1 else [axes]
-        for i, col in enumerate(cat_cols):
-            vc = df_clean[col].astype(str).value_counts().head(8)
-            axes[i].barh(vc.index.astype(str), vc.values, color='#C0392B', edgecolor='black')
-            axes[i].set_title(f"{col} (Top 8)")
-            axes[i].invert_yaxis()
-        for j in range(i+1, len(axes)):
-            axes[j].axis('off')
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-
-    st.markdown("---")
-    st.subheader("Correlation Heatmap (Encoded Features)")
-    corr_data = X.copy()
-    corr_data['Severity'] = y.values
-    corr = corr_data.corr()
-    fig, ax = plt.subplots(figsize=(10, 8))
-    sns.heatmap(corr, annot=True, fmt=".2f", cmap='RdBu_r', center=0, ax=ax,
-                cbar_kws={'shrink': 0.8}, annot_kws={'size': 8})
-    plt.tight_layout()
+    st.subheader("Severity distribution")
+    fig, ax = plt.subplots(figsize=(5, 4))
+    counts = prepared[CONFIG["target_name"]].value_counts()
+    ax.pie(counts.values, labels=counts.index, autopct="%1.1f%%",
+           colors=["#C0392B", "#27AE60"], startangle=90)
+    fig.tight_layout()
     st.pyplot(fig)
-    plt.close()
+    plt.close(fig)
 
-# ------------------------------------------------------------
-# TAB 3: K-MEANS HOTSPOTS
-# ------------------------------------------------------------
-with tab3:
-    st.header("🎯 K-Means Clustering — Accident Hotspots")
-
-    df_km = df_raw.copy()
-
-    if 'LOCATION' in df_km.columns:
-        df_km['LOCATION_CLEAN'] = df_km['LOCATION'].astype(str).str.strip().str.upper()
-        df_km['LOCATION_KEY'] = df_km['LOCATION_CLEAN'].str.extract(
-            r'(P\d+[A-Z]?|BARANGAY\s+\w+|CAMPO\s+\d+|C\d+|BUNAWAN BROOK|LIBERTAD|'
-            r'CONSUELO|SAN TEODORO|SAN ANDRES|MAMBALILI|IMELDA|NUEVA ERA|POBLACION|SAN MARCOS)',
-            expand=False).fillna(df_km['LOCATION_CLEAN'])
-
-    if 'LOCATION_KEY' in df_km.columns:
-        loc_counts = df_km['LOCATION_KEY'].value_counts()
-        df_km['LOCATION_FREQ'] = df_km['LOCATION_KEY'].map(loc_counts).fillna(0)
-    else:
-        df_km['LOCATION_FREQ'] = 1
-
-    df_km['DATE_PARSED'] = pd.to_datetime(df_km['DATE'], errors='coerce')
-    df_km['MONTH'] = df_km['DATE_PARSED'].dt.month.fillna(1)
-    df_km['HOUR'] = pd.to_datetime(df_km['TIME'].astype(str), errors='coerce').dt.hour.fillna(12)
-
-    def sev_num(v):
-        v = str(v).strip().lower()
-        if 'fatal' in v: return 3
-        if 'major' in v: return 2
-        if 'minor' in v: return 1
-        return 0
-    df_km['SEV_NUM'] = df_km['SEVERITY'].apply(sev_num) if 'SEVERITY' in df_km.columns else 0
-
-    km_features = ['LOCATION_FREQ', 'MONTH', 'HOUR', 'SEV_NUM']
-    km_data = df_km[km_features].dropna()
-    km_data = km_data[~km_data.isin([np.inf, -np.inf]).any(axis=1)]
-
-    if len(km_data) < n_clusters * 2:
-        st.warning("Not enough data for K-Means with this cluster count. Reduce clusters.")
-    else:
-        scaler_km = StandardScaler()
-        km_scaled = scaler_km.fit_transform(km_data)
-
-        kmeans = KMeans(n_clusters=n_clusters, random_state=int(random_state), n_init=10)
-        labels = kmeans.fit_predict(km_scaled)
-
-        sil = silhouette_score(km_scaled, labels)
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Clusters", n_clusters)
-        c2.metric("Silhouette Score", f"{sil:.4f}")
-        c3.metric("Records Clustered", f"{len(labels):,}")
-
-        st.caption(f"**Interpretation:** Silhouette scores closer to 1.0 indicate well-separated clusters. "
-                   f"Score of {sil:.4f} suggests "
-                   f"{'strong' if sil > 0.5 else 'moderate' if sil > 0.25 else 'weak'} cluster structure.")
-
-        st.markdown("---")
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.subheader("Cluster Sizes")
-            cluster_counts = pd.Series(labels).value_counts().sort_index()
-            fig, ax = plt.subplots(figsize=(6, 4))
-            colors_km = plt.cm.Set2(np.linspace(0, 1, n_clusters))
-            ax.bar([f"C{i}" for i in cluster_counts.index], cluster_counts.values,
-                   color=colors_km, edgecolor='black')
-            ax.set_ylabel("Number of Accidents")
-            ax.set_title("Accidents per Cluster")
-            ax.grid(axis='y', alpha=0.3)
-            st.pyplot(fig)
-            plt.close()
-
-        with col2:
-            st.subheader("Cluster Profile (Mean Values)")
-            km_df = km_data.copy()
-            km_df['CLUSTER'] = labels
-            st.dataframe(km_df.groupby('CLUSTER').mean().round(3), use_container_width=True)
-
-        st.markdown("---")
-        st.subheader("Top Locations by Cluster (Hotspots)")
-        if 'LOCATION_KEY' in df_km.columns:
-            df_km_valid = df_km.loc[km_data.index].copy()
-            df_km_valid['CLUSTER'] = labels
-            for c in sorted(df_km_valid['CLUSTER'].unique()):
-                top_locs = df_km_valid[df_km_valid['CLUSTER'] == c]['LOCATION_KEY'].value_counts().head(5)
-                st.markdown(f"**Cluster {c} — Top 5 Locations:**")
-                st.dataframe(top_locs.rename('Accidents').to_frame(), use_container_width=True)
-
-# ------------------------------------------------------------
-# TAB 4: DECISION TREE
-# ------------------------------------------------------------
-with tab4:
-    st.header("🌳 Decision Tree — Severity Classification")
-
-    m = compute_metrics(results['y_test'], results['y_pred'], results['y_prob'])
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Accuracy",  f"{m['Accuracy']:.4f}")
-    c2.metric("Precision", f"{m['Precision']:.4f}")
-    c3.metric("Recall",    f"{m['Recall']:.4f}")
-    c4.metric("F1-Score",  f"{m['F1-Score']:.4f}")
-    c5.metric("ROC-AUC",   f"{m['ROC-AUC']:.4f}")
-
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Confusion Matrix")
-        cm = confusion_matrix(results['y_test'], results['y_pred'])
-        fig, ax = plt.subplots(figsize=(5, 4))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Reds',
-                    xticklabels=['Low-Risk', 'High-Risk'],
-                    yticklabels=['Low-Risk', 'High-Risk'], ax=ax)
-        ax.set_xlabel("Predicted")
-        ax.set_ylabel("Actual")
+    st.subheader("Records per year")
+    year_counts = prepared[CONFIG["year_col"]].value_counts().sort_index()
+    fig = bar_chart(year_counts, "Accidents per year", color="#34495E")
+    if fig:
         st.pyplot(fig)
-        plt.close()
+        plt.close(fig)
 
-    with col2:
-        st.subheader("ROC Curve")
-        if len(set(results['y_test'])) > 1:
-            fpr, tpr, _ = roc_curve(results['y_test'], results['y_prob'])
-            fig, ax = plt.subplots(figsize=(5, 4))
-            ax.plot(fpr, tpr, color='#8B0000', lw=2, label=f"AUC = {m['ROC-AUC']:.3f}")
-            ax.plot([0, 1], [0, 1], 'k--', lw=1)
-            ax.set_xlabel("False Positive Rate")
-            ax.set_ylabel("True Positive Rate")
-            ax.legend()
-            ax.grid(alpha=0.3)
+    st.subheader("Top cause categories")
+    if CONFIG["cause_col"] in prepared.columns:
+        cause_counts = prepared[CONFIG["cause_col"]].astype(str).apply(clean_text).value_counts().head(10)
+        fig = bar_chart(cause_counts, "Top cause categories", color="#7F8C8D")
+        if fig:
             st.pyplot(fig)
-            plt.close()
-        else:
-            st.info("ROC curve requires both classes in the test set.")
+            plt.close(fig)
 
-    st.subheader("Classification Report")
-    rep = classification_report(results['y_test'], results['y_pred'],
-                                target_names=['Low-Risk', 'High-Risk'],
-                                output_dict=True, zero_division=0)
-    st.dataframe(pd.DataFrame(rep).T.round(4), use_container_width=True)
+with tabs[1]:
+    st.subheader("Monthly trend")
+    monthly = prepared.dropna(subset=["_month"]).groupby("_month").size()
+    fig = line_chart(monthly, "Accidents per month")
+    if fig:
+        st.pyplot(fig)
+        plt.close(fig)
 
-    st.markdown("---")
-    st.subheader("Feature Importance (Significant Factors)")
-    importances = pd.Series(results['model'].feature_importances_, index=feature_cols).sort_values(ascending=True)
-    fig, ax = plt.subplots(figsize=(10, max(4, len(importances)*0.4)))
-    importances.plot(kind='barh', color='#8B0000', ax=ax, edgecolor='black')
-    ax.set_xlabel("Importance (Gini)")
-    ax.set_title("Decision Tree Feature Importance")
-    st.pyplot(fig)
-    plt.close()
+    st.subheader("Hourly trend")
+    hourly = prepared.dropna(subset=["_hour"]).groupby("_hour").size()
+    fig = line_chart(hourly, "Accidents per hour", color="#8B0000")
+    if fig:
+        st.pyplot(fig)
+        plt.close(fig)
 
-    st.caption("Higher importance → stronger contribution to predicting High-Risk severity.")
+    st.subheader("Severity by year")
+    if prepared[CONFIG["year_col"]].notna().any():
+        by_year = pd.crosstab(prepared[CONFIG["year_col"]], prepared[CONFIG["target_name"]])
+        st.dataframe(by_year, use_container_width=True)
+        fig, ax = plt.subplots(figsize=(8, 4))
+        by_year.plot(kind="bar", ax=ax, color=["#27AE60", "#C0392B"], edgecolor="black")
+        ax.set_ylabel("Records")
+        ax.set_title("Severity by year")
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
 
-    st.markdown("---")
-    with st.expander("🌲 View Decision Tree Structure"):
+with tabs[2]:
+    st.subheader("Severity vs categorical variables")
+    cat_cols = [c for c in [CONFIG["weather_col"], CONFIG["road_col"],
+                            CONFIG["vehicle_col"], CONFIG["cause_col"],
+                            CONFIG["gender_col"]] if c in prepared.columns]
+    for col in cat_cols:
+        table = pd.crosstab(prepared[col].astype(str).apply(clean_text),
+                            prepared[CONFIG["target_name"]])
+        if table.empty:
+            continue
         try:
-            fig, ax = plt.subplots(figsize=(20, 10))
-            plot_tree(results['model'], feature_names=feature_cols,
-                      class_names=['Low-Risk', 'High-Risk'],
-                      filled=True, rounded=True, fontsize=9, ax=ax)
+            v = cramers_v(table)
+        except Exception:
+            v = float("nan")
+        st.markdown(f"**{col}** — Cramer's V = {v:.3f}" if not np.isnan(v) else f"**{col}**")
+        st.dataframe(table, use_container_width=True)
+
+    st.subheader("Top pairwise associations")
+    assoc = association_pairs(prepared, cat_cols)
+    if not assoc.empty:
+        st.dataframe(assoc, use_container_width=True)
+        top = assoc.iloc[0]
+        st.write(
+            f"Strongest association: {top['variable_a']} and {top['variable_b']} "
+            f"(Cramer's V = {top['cramers_v']})."
+        )
+
+with tabs[3]:
+    st.subheader("Cluster summary")
+    result = cluster_hotspots(prepared, CONFIG, cluster_count)
+    if result is None:
+        st.warning("Not enough records to cluster with this configuration.")
+    else:
+        st.metric("Silhouette score", f"{result['silhouette']:.4f}")
+        profile = result["features"].groupby("cluster").agg(
+            records=("location", "size"),
+            mean_location_freq=("location_freq", "mean"),
+            mean_month=("month", "mean"),
+            mean_hour=("hour", "mean"),
+            high_risk_share=("severity_score", "mean"),
+        ).round(3)
+        st.dataframe(profile, use_container_width=True)
+
+        st.subheader("Top locations per cluster")
+        for cluster_id in sorted(result["features"]["cluster"].unique()):
+            subset = result["features"][result["features"]["cluster"] == cluster_id]
+            top_locations = subset["location"].value_counts().head(5)
+            st.markdown(f"Cluster {cluster_id}")
+            st.dataframe(top_locations.rename("Records").to_frame(), use_container_width=True)
+
+        st.subheader("Cluster sizes")
+        sizes = result["features"]["cluster"].value_counts().sort_index()
+        fig = bar_chart(sizes, "Records per cluster", color="#16A085")
+        if fig:
             st.pyplot(fig)
-            plt.close()
-        except Exception as e:
-            st.warning(f"Could not render tree: {e}")
+            plt.close(fig)
 
-# ------------------------------------------------------------
-# TAB 5: CROSS-VALIDATION
-# ------------------------------------------------------------
-with tab5:
-    st.header("📋 Stratified K-Fold Cross-Validation")
+with tabs[4]:
+    st.subheader("Decision tree feature importance")
+    features, target, feature_cols = build_model_frame(prepared, CONFIG)
+    if features.empty or target.nunique() < 2:
+        st.warning("Not enough encoded records to fit a model.")
+    else:
+        tree = train_tree(features, target, tree_depth, CONFIG["random_state"])
+        if tree is None:
+            st.warning("Model could not be trained with the current configuration.")
+        else:
+            imp = tree["importance"]
+            fig = bar_chart(imp, "Feature importance (Gini)", color="#8B0000")
+            if fig:
+                st.pyplot(fig)
+                plt.close(fig)
+            st.dataframe(imp.rename("Importance").to_frame(), use_container_width=True)
 
-    k = st.slider("Number of folds", 3, 10, 5)
+            st.subheader("Severity share by top feature")
+            top_feature = imp.index[0]
+            if top_feature in prepared.columns:
+                share = prepared.groupby(prepared[top_feature].astype(str).apply(clean_text))[CONFIG["target_name"]].apply(
+                    lambda s: (s == "High-Risk").mean()
+                ).sort_values(ascending=False).head(10)
+                st.dataframe(share.rename("High-risk share").to_frame().round(3), use_container_width=True)
 
-    X_scaled = StandardScaler().fit_transform(X)
-    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
+with tabs[5]:
+    st.subheader("Model metrics")
+    features, target, feature_cols = build_model_frame(prepared, CONFIG)
+    if features.empty or target.nunique() < 2:
+        st.warning("Not enough encoded records to evaluate the model.")
+    else:
+        tree = train_tree(features, target, tree_depth, CONFIG["random_state"])
+        if tree is None:
+            st.warning("Model could not be trained with the current configuration.")
+        else:
+            m = tree["metrics"]
+            cols = st.columns(4)
+            cols[0].metric("Accuracy", f"{m['accuracy']:.4f}")
+            cols[1].metric("Precision", f"{m['precision']:.4f}")
+            cols[2].metric("Recall", f"{m['recall']:.4f}")
+            cols[3].metric("F1-Score", f"{m['f1']:.4f}")
 
-    dt_cv = cross_val_score(
-        DecisionTreeClassifier(max_depth=max_depth, random_state=42, class_weight='balanced'),
-        X_scaled, y, cv=cv, scoring='accuracy'
-    )
+            st.subheader("Confusion matrix")
+            cm = tree["confusion"]
+            labels = ["Low-Risk", "High-Risk"]
+            fig, ax = plt.subplots(figsize=(5, 4))
+            sns.heatmap(cm, annot=True, fmt="d", cmap="Reds",
+                        xticklabels=labels, yticklabels=labels, ax=ax)
+            ax.set_xlabel("Predicted")
+            ax.set_ylabel("Actual")
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
 
-    cv_df = pd.DataFrame({'Decision Tree': dt_cv})
-    cv_df.index = [f"Fold {i+1}" for i in range(k)]
-    cv_df.loc['Mean'] = cv_df.mean()
-    cv_df.loc['Std']  = cv_df.iloc[:-2].std()
+            st.subheader("5-fold cross-validation accuracy")
+            cv = tree["cv"]
+            st.write(f"Mean = {cv.mean():.4f}, Std = {cv.std():.4f}")
+            fig, ax = plt.subplots(figsize=(7, 3))
+            ax.bar([f"Fold {i + 1}" for i in range(len(cv))], cv, color="#1f4e79", edgecolor="black")
+            ax.axhline(cv.mean(), color="green", linestyle="--")
+            ax.set_ylim(0, 1.05)
+            ax.set_ylabel("Accuracy")
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
 
-    st.dataframe(cv_df.round(4), use_container_width=True)
+with tabs[6]:
+    st.subheader("Highest-risk combinations")
+    if CONFIG["vehicle_col"] in prepared.columns and CONFIG["cause_col"] in prepared.columns:
+        combo = (prepared.groupby([
+            prepared[CONFIG["vehicle_col"]].astype(str).apply(clean_text),
+            prepared[CONFIG["cause_col"]].astype(str).apply(clean_text),
+        ])[CONFIG["target_name"]]
+            .agg(records="size", high_risk=lambda s: (s == "High-Risk").sum()))
+        combo["high_risk_share"] = (combo["high_risk"] / combo["records"]).round(3)
+        combo = combo[combo["records"] >= 5].sort_values("high_risk_share", ascending=False).head(10)
+        st.dataframe(combo, use_container_width=True)
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    cv_df.iloc[:-2].plot(kind='bar', ax=ax, color='#8B0000', edgecolor='black', legend=False)
-    ax.set_ylabel("Accuracy")
-    ax.set_title(f"{k}-Fold Cross-Validation Accuracy per Fold")
-    ax.axhline(dt_cv.mean(), color='green', linestyle='--', label=f"Mean = {dt_cv.mean():.4f}")
-    ax.legend()
-    ax.grid(axis='y', alpha=0.3)
-    plt.xticks(rotation=0)
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close()
+    st.subheader("Peak months by high-risk share")
+    monthly = (prepared.dropna(subset=["_month"])
+               .groupby("_month")[CONFIG["target_name"]]
+               .apply(lambda s: (s == "High-Risk").mean())
+               .sort_values(ascending=False).head(6))
+    st.dataframe(monthly.rename("High-risk share").to_frame().round(3), use_container_width=True)
 
-    st.info(f"**Mean CV Accuracy:** {dt_cv.mean():.4f} ± {dt_cv.std():.4f}")
-
-# ------------------------------------------------------------
-# TAB 6: RECOMMENDATIONS
-# ------------------------------------------------------------
-with tab6:
-    st.header("💡 Recommendations & Interpretation")
-
-    best_acc = metrics_table['Accuracy'].max()
-    st.success(f"### 🏆 Decision Tree Accuracy: **{best_acc:.4f}**")
-
-    st.markdown("---")
-    st.subheader("🔑 Top Contributing Factors")
-    importances = pd.Series(results['model'].feature_importances_, index=feature_cols).sort_values(ascending=False)
-    top_factors = importances.head(5)
-    for i, (factor, imp) in enumerate(top_factors.items(), 1):
-        st.markdown(f"**{i}. {factor}** — importance = {imp:.4f}")
-
-    st.markdown("---")
-    st.subheader("🎯 Recommendations for Bunawan, Agusan del Sur")
-
-    st.markdown(f"""
-    Based on the analysis of **{len(df_clean):,}** recorded accidents (2021–2025)
-    using **K-Means Clustering** and **Decision Tree** algorithms:
-
-    #### 1. For the Local Government Unit (LGU) of Bunawan
-    - **Prioritize hotspot clusters** identified in the K-Means tab for road
-      infrastructure improvements (lighting, signage, rumble strips).
-    - Deploy **traffic enforcement** during high-risk hours and months based
-      on temporal patterns.
-    - Allocate **emergency response resources** near high-density accident clusters.
-
-    #### 2. For the PNP Traffic Enforcement Unit
-    - Intensify **checkpoints and patrols** in barangays with the highest
-      accident frequencies (see Cluster top-locations).
-    - Focus on **motorcycle-related violations** (helmet laws, overspeeding,
-      alcohol-influenced driving) given motorcycle dominance in the data.
-
-    #### 3. For the MDRRMO
-    - Use the **hotspot map** to preposition response teams.
-    - Improve **data recording consistency** — many records show inconsistent
-      date formats and duplicate entries.
-
-    #### 4. For Drivers and Pedestrians
-    - Exercise **extreme caution during rainy/stormy weather** and at night.
-    - Motorcycle riders should always wear **helmets and reflective gear**.
-    - Avoid **alcohol-influenced driving**, a recurring cause in the records.
-
-    #### 5. For Future Researchers
-    - Integrate **GIS coordinates** for true spatial clustering.
-    - Apply **Random Forest, XGBoost, or Neural Networks** for comparison.
-    - Include **traffic volume and road geometry** as features.
-    - Address class imbalance with **SMOTE**.
-    """)
-
-    st.markdown("---")
-    st.subheader("📥 Download Results")
-    csv = metrics_table.to_csv().encode('utf-8')
-    st.download_button("Download Metrics CSV", csv, "model_metrics.csv", "text/csv")
-
-    preds = pd.DataFrame({
-        'Actual': y_test.map({0: 'Low-Risk', 1: 'High-Risk'}),
-        'Predicted': pd.Series(results['y_pred']).map({0: 'Low-Risk', 1: 'High-Risk'})
-    })
-    st.download_button("Download Predictions CSV",
-                       preds.to_csv(index=False).encode('utf-8'),
-                       "predictions.csv", "text/csv")
-
-# Footer
-st.markdown("---")
-st.caption("🎓 Capstone Dashboard • Road Accidents Patterns in Bunawan, Agusan del Sur "
-           "Using Historical Data • Puno & Manuel • Agusan del Sur State University • 2026")
+    st.subheader("Top risky locations")
+    loc = (prepared.groupby("_loc_key")[CONFIG["target_name"]]
+           .agg(records="size", high_risk=lambda s: (s == "High-Risk").sum()))
+    loc["high_risk_share"] = (loc["high_risk"] / loc["records"]).round(3)
+    loc = loc[loc["records"] >= 5].sort_values("high_risk_share", ascending=False).head(10)
+    st.dataframe(loc, use_container_width=True)
