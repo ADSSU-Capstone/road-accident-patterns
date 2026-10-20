@@ -1,4 +1,6 @@
 import re
+import os
+import glob
 import warnings
 from itertools import combinations
 
@@ -10,7 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from scipy.stats import chi2_contingency, f_oneway
+from scipy.stats import chi2_contingency
 from sklearn.cluster import KMeans
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, confusion_matrix, classification_report,
@@ -83,22 +85,25 @@ def derive_year_from_text(*candidates):
             return int(match.group(1))
     return np.nan
 
-def load_workbook(uploaded_files):
+def load_local_data():
+    files = glob.glob("*.xlsx") + glob.glob("*.xls") + glob.glob("*.csv")
+    if not files:
+        return pd.DataFrame()
+        
     frames = []
-    for file in uploaded_files:
-        name = file.name
-        file.seek(0)
+    for filepath in files:
+        name = os.path.basename(filepath)
         if name.lower().endswith(".csv"):
             try:
-                df = pd.read_csv(file, encoding="utf-8-sig", low_memory=False)
+                df = pd.read_csv(filepath, encoding="utf-8-sig", low_memory=False)
             except UnicodeDecodeError:
-                file.seek(0)
-                df = pd.read_csv(file, encoding="latin-1", low_memory=False)
+                df = pd.read_csv(filepath, encoding="latin-1", low_memory=False)
             df["_source_file"] = clean_text(name)
             df["_year"] = derive_year_from_text(name)
             frames.append(normalize_columns(df))
             continue
-        xls = pd.ExcelFile(file)
+            
+        xls = pd.ExcelFile(filepath)
         for sheet in xls.sheet_names:
             try:
                 sheet_df = pd.read_excel(xls, sheet_name=sheet, header=0)
@@ -108,8 +113,10 @@ def load_workbook(uploaded_files):
             sheet_year = derive_year_from_text(name, sheet)
             sheet_df["_year"] = sheet_year
             frames.append(normalize_columns(sheet_df))
+            
     if not frames:
         return pd.DataFrame()
+        
     combined = pd.concat(frames, ignore_index=True, sort=False)
     combined = combined.loc[:, ~combined.columns.duplicated(keep="first")]
     return combined
@@ -292,21 +299,12 @@ def line_chart(series, title, color="#1f4e79"):
 st.set_page_config(page_title="Road Accident Dashboard", page_icon="", layout="wide")
 
 st.title("Road Accident Dashboard")
-st.caption("Computed results from uploaded accident records")
+st.caption("Computed results from historical accident records")
 
-uploaded = st.sidebar.file_uploader(
-    "Upload dataset files",
-    type=["xlsx", "xls", "csv"],
-    accept_multiple_files=True,
-)
+raw = load_local_data()
 
-if not uploaded:
-    st.info("Upload one or more dataset files to generate results.")
-    st.stop()
-
-raw = load_workbook(uploaded)
 if raw.empty:
-    st.error("No readable records were found in the uploaded files.")
+    st.error("No dataset found. Please upload a dataset file (e.g., dataset.xlsx) to your GitHub repository alongside this app.py file.")
     st.stop()
 
 prepared = prepare_features(raw, CONFIG)
